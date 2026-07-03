@@ -285,8 +285,6 @@ static void _node_isr_main(void *arg)
         }
         // start a new TX
         if ((atomic_load(&twai_ctx->state) != TWAI_ERROR_BUS_OFF) && xQueueReceiveFromISR(twai_ctx->tx_mount_queue, &twai_ctx->p_curr_tx, &do_yield)) {
-            // Sanity check, must in `hw_busy` here, otherwise logic bug is somewhere
-            assert(twai_ctx->hw_busy);
             _node_start_trans(twai_ctx);
         } else {
             atomic_store(&twai_ctx->hw_busy, false);
@@ -626,7 +624,10 @@ static esp_err_t _node_queue_tx(twai_node_handle_t node, const twai_frame_t *fra
             if (dequeue_result == pdTRUE) {
                 _node_start_trans(twai_ctx);
             } else {
-                assert(false && "should always get frame at this moment");
+                // Backport of upstream esp-idf commit
+                // 10273d3c6b6c4fbbb1244c67280adcf970d6b16d (fixes GH issue #18081);
+                // any reason here means frame already taken and maybe finished by fast hardware, so back `hw_busy` to false
+                atomic_store(&twai_ctx->hw_busy, false);
             }
         }
 
