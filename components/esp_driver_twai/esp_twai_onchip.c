@@ -9,6 +9,7 @@
 #include "esp_private/twai_interface.h"
 #include "esp_private/twai_utils.h"
 #include "twai_private.h"
+#include "freertos/timers.h"
 
 #if !SOC_RCC_IS_INDEPENDENT
 #define TWAI_RCC_ATOMIC() PERIPH_RCC_ATOMIC()
@@ -300,6 +301,30 @@ static void _node_isr_main(void *arg)
     }
 }
 
+// xEventGroupSetBitsFromISR() doesn't set bits in place; it pends a call
+// holding the raw event group pointer for the timer task to run later--
+// possibly long after _node_destroy() under load, making the delete a 
+// use-after-free (observed: timer-task panic when bus-off recovery deleted
+// the node). The timer command queue is FIFO, so pending one
+// marker call and blocking until it runs guarantees every earlier set-bits on
+// this group has executed. Only valid after esp_intr_free(), once no new
+// pends can arrive. Unfixed upstream as of 2026-07; drop once upstream fixes.
+static void _pended_flush_marker(void *sem, uint32_t unused)
+{
+    (void)unused;
+    xSemaphoreGive((SemaphoreHandle_t)sem);
+}
+
+static void _node_flush_pended_setbits(void)
+{
+    StaticSemaphore_t sem_storage;
+    SemaphoreHandle_t sem = xSemaphoreCreateBinaryStatic(&sem_storage);
+    if (xTimerPendFunctionCall(_pended_flush_marker, sem, 0, portMAX_DELAY) == pdPASS) {
+        xSemaphoreTake(sem, portMAX_DELAY);
+    }
+    vSemaphoreDelete(sem);
+}
+
 static void _node_destroy(twai_onchip_ctx_t *twai_ctx)
 {
     if (twai_ctx->pm_lock) {
@@ -312,6 +337,9 @@ static void _node_destroy(twai_onchip_ctx_t *twai_ctx)
         vQueueDeleteWithCaps(twai_ctx->tx_mount_queue);
     }
     if (twai_ctx->event_group) {
+        // drain pended xEventGroupSetBitsFromISR
+        // calls that still reference this group (see _node_flush_pended_setbits)
+        _node_flush_pended_setbits();
         vEventGroupDeleteWithCaps(twai_ctx->event_group);
     }
     if (twai_ctx->ctrlr_id != -1) {
