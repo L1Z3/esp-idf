@@ -9,6 +9,8 @@
 #include "esp_private/twai_interface.h"
 #include "esp_private/twai_utils.h"
 #include "twai_private.h"
+// LOCAL PATCH (wican-tinkering): for xTimerPendFunctionCall in _node_flush_pended_setbits()
+#include "freertos/timers.h"
 
 #if !SOC_RCC_IS_INDEPENDENT
 #define TWAI_RCC_ATOMIC() PERIPH_RCC_ATOMIC()
@@ -300,6 +302,33 @@ static void _node_isr_main(void *arg)
     }
 }
 
+// LOCAL PATCH (wican-tinkering): xEventGroupSetBitsFromISR() does not set the
+// bits in place; it queues a pended function call holding the raw event group
+// pointer for the timer service task (priority 1) to execute later. Under load
+// that task can lag far behind the ISR, so deleting the event group while such
+// a call is still queued makes the timer task dereference freed memory
+// (observed: timer-task Load access fault during GVRET playback when bus-off
+// recovery deleted the node). The timer command queue is FIFO, so pending one
+// more call from task context and blocking until it runs guarantees every
+// earlier pended set-bits on this group has executed. Only valid after
+// esp_intr_free(), once the ISR can no longer queue new calls. Unfixed
+// upstream as of 2026-07; drop once the vendored IDF closes this race.
+static void _pended_flush_marker(void *sem, uint32_t unused)
+{
+    (void)unused;
+    xSemaphoreGive((SemaphoreHandle_t)sem);
+}
+
+static void _node_flush_pended_setbits(void)
+{
+    StaticSemaphore_t sem_storage;
+    SemaphoreHandle_t sem = xSemaphoreCreateBinaryStatic(&sem_storage);
+    if (xTimerPendFunctionCall(_pended_flush_marker, sem, 0, portMAX_DELAY) == pdPASS) {
+        xSemaphoreTake(sem, portMAX_DELAY);
+    }
+    vSemaphoreDelete(sem);
+}
+
 static void _node_destroy(twai_onchip_ctx_t *twai_ctx)
 {
     if (twai_ctx->pm_lock) {
@@ -312,6 +341,9 @@ static void _node_destroy(twai_onchip_ctx_t *twai_ctx)
         vQueueDeleteWithCaps(twai_ctx->tx_mount_queue);
     }
     if (twai_ctx->event_group) {
+        // LOCAL PATCH (wican-tinkering): drain pended xEventGroupSetBitsFromISR
+        // calls that still reference this group (see _node_flush_pended_setbits)
+        _node_flush_pended_setbits();
         vEventGroupDeleteWithCaps(twai_ctx->event_group);
     }
     if (twai_ctx->ctrlr_id != -1) {
